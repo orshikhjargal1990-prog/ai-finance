@@ -11,6 +11,7 @@ const { executeFinanceQuery } = require('./finance-tools');
 const { normalizeSpokenAmounts } = require('./speech-normalizer');
 
 dotenv.config({ path: path.join(__dirname, '.env') });
+const database = require('./database');
 
 const app = express();
 const port = Number.parseInt(process.env.PORT || '8000', 10);
@@ -19,6 +20,9 @@ const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET?.trim() || '';
 const openaiApiKey = process.env.OPENAI_API_KEY?.trim() || '';
 const openaiModel = process.env.OPENAI_MODEL?.trim() || 'gpt-4o-mini';
 const siteAccessPassword = process.env.SITE_ACCESS_PASSWORD || '';
+if (process.env.NODE_ENV === 'production' && database.enabled() && !siteAccessPassword) {
+  throw new Error('SITE_ACCESS_PASSWORD is required when DATABASE_URL is configured in production');
+}
 const publicDir = __dirname;
 const telegram = telegramToken ? createTelegramClient(telegramToken) : null;
 const parseWithOpenAI = createFinanceParser(openaiApiKey, openaiModel);
@@ -61,7 +65,46 @@ app.get('/api/health', (_request, response) => {
     server: 'ажиллаж байна',
     telegramConfigured: Boolean(telegramToken),
     openaiConfigured: Boolean(openaiApiKey),
+    databaseConfigured: database.enabled(),
   });
+});
+
+app.get('/api/state', async (_request, response) => {
+  if (!database.enabled()) return response.status(503).json({ ok: false, error: 'Өгөгдлийн сан тохируулагдаагүй байна.' });
+  try {
+    const result = await database.getState();
+    return result ? response.json({ ok: true, ...result }) : response.status(404).json({ ok: false, error: 'Өгөгдөл хараахан үүсээгүй байна.' });
+  } catch (error) {
+    console.error('[Database] Уншихад алдаа гарлаа.', { code: error.code });
+    return response.status(503).json({ ok: false, error: 'Өгөгдлийн сантай холбогдож чадсангүй.' });
+  }
+});
+
+app.post('/api/state/import', async (request, response) => {
+  if (!database.enabled()) return response.status(503).json({ ok: false, error: 'Өгөгдлийн сан тохируулагдаагүй байна.' });
+  const state = database.cleanState(request.body?.state);
+  if (!state) return response.status(400).json({ ok: false, error: 'Өгөгдлийн бүтэц буруу байна.' });
+  try {
+    const result = await database.createState(state);
+    return result ? response.status(201).json({ ok: true, ...result }) : response.status(409).json({ ok: false, error: 'Өгөгдөл аль хэдийн үүссэн байна.' });
+  } catch (error) {
+    console.error('[Database] Шилжүүлэхэд алдаа гарлаа.', { code: error.code });
+    return response.status(503).json({ ok: false, error: 'Өгөгдлийн сантай холбогдож чадсангүй.' });
+  }
+});
+
+app.put('/api/state', async (request, response) => {
+  if (!database.enabled()) return response.status(503).json({ ok: false, error: 'Өгөгдлийн сан тохируулагдаагүй байна.' });
+  const state = database.cleanState(request.body?.state);
+  const version = Number(request.body?.version);
+  if (!state || !Number.isSafeInteger(version) || version < 1) return response.status(400).json({ ok: false, error: 'Өгөгдлийн бүтэц буруу байна.' });
+  try {
+    const result = await database.updateState(state, version);
+    return result ? response.json({ ok: true, ...result }) : response.status(409).json({ ok: false, error: 'Өөр төхөөрөмж дээр мэдээлэл өөрчлөгдсөн байна. Хуудсаа дахин ачаална уу.' });
+  } catch (error) {
+    console.error('[Database] Хадгалахад алдаа гарлаа.', { code: error.code });
+    return response.status(503).json({ ok: false, error: 'Өгөгдлийн сантай холбогдож чадсангүй.' });
+  }
 });
 
 app.post('/api/ai/transcribe', express.raw({ type: ['audio/webm', 'audio/mp4', 'audio/mpeg', 'audio/ogg', 'audio/wav', 'audio/x-m4a'], limit: '15mb' }), async (request, response) => {

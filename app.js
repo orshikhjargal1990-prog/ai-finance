@@ -2,18 +2,75 @@ const seed=[{id:1,date:'2026-10-03',type:'expense',category:'Хоол',note:'Ө�
 let tx=JSON.parse(localStorage.getItem('ai-finance-tx')||'null')||seed;let currentPage='dashboard';
 const defaultCategories=['Хоол','Материал','Тээвэр','Борлуулалт','Цалин','Бусад'];
 let categories=JSON.parse(localStorage.getItem('ai-finance-categories')||'null')||[...new Set([...defaultCategories,...tx.map(x=>x.category)])];
-function saveCategories(){localStorage.setItem('ai-finance-categories',JSON.stringify(categories))}
+function saveCategories(){localStorage.setItem('ai-finance-categories',JSON.stringify(categories));queuePersist()}
 let dashboardAccount=localStorage.getItem('ai-finance-dashboard-account')||'all';
 let categoryLimits=JSON.parse(localStorage.getItem('ai-finance-category-limits')||'{}');
-function saveCategoryLimits(){localStorage.setItem('ai-finance-category-limits',JSON.stringify(categoryLimits))}
+function saveCategoryLimits(){localStorage.setItem('ai-finance-category-limits',JSON.stringify(categoryLimits));queuePersist()}
 let chatDrafts=[];
 let chatHistory=JSON.parse(localStorage.getItem('ai-finance-chat-history')||'[]');
 const money=n=>new Intl.NumberFormat('mn-MN').format(n)+'₮'; const esc=s=>String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
 const formatChatText=s=>esc(s).replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\n/g,'<br>');
-function save(){localStorage.setItem('ai-finance-tx',JSON.stringify(tx))}function toast(s){let x=document.getElementById('toast');x.textContent=s;x.classList.add('show');setTimeout(()=>x.classList.remove('show'),2600)}
+let serverVersion=0, syncTimer=null, syncRunning=false, syncBlocked=false;
+function snapshot(){return {transactions:tx,categories,limits:categoryLimits,chatHistory}}
+function queuePersist(){
+  if(!serverVersion)return;
+  localStorage.setItem('ai-finance-pending-state',JSON.stringify({version:serverVersion,state:snapshot()}));
+  if(syncBlocked)return;
+  clearTimeout(syncTimer);syncTimer=setTimeout(flushPersist,120);
+}
+async function flushPersist(){
+  if(syncRunning||syncBlocked||!serverVersion)return;
+  syncRunning=true;
+  try{
+    while(localStorage.getItem('ai-finance-pending-state')){
+      const pending=JSON.parse(localStorage.getItem('ai-finance-pending-state'));
+      const response=await fetch('/api/state',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({version:serverVersion,state:pending.state})});
+      const data=await response.json();
+      if(!response.ok||!data.ok)throw new Error(data.error||'Серверт хадгалах боломжгүй байна.');
+      serverVersion=data.version;
+      const latest=JSON.parse(localStorage.getItem('ai-finance-pending-state')||'null');
+      if(latest&&JSON.stringify(latest.state)===JSON.stringify(pending.state))localStorage.removeItem('ai-finance-pending-state');
+      else if(latest)localStorage.setItem('ai-finance-pending-state',JSON.stringify({version:serverVersion,state:latest.state}));
+    }
+  }catch(error){syncBlocked=true;toast('Серверт хадгалж чадсангүй. Энэ төхөөрөмж дэх хуулбарыг хадгаллаа. Хуудсаа дахин ачаалж шалгана уу.');console.error('[Sync]',error.message)}
+  finally{syncRunning=false}
+}
+async function loadServerData(){
+  const response=await fetch('/api/state');
+  let data=await response.json();
+  if(response.status===404){
+    const hasLocal=['ai-finance-tx','ai-finance-categories','ai-finance-category-limits','ai-finance-chat-history'].some(key=>localStorage.getItem(key));
+    const importLocal=hasLocal&&confirm('Энэ браузерт хадгалсан санхүүгийн мэдээллийг шинэ өгөгдлийн сан руу шилжүүлэх үү?');
+    const initial=importLocal?snapshot():{transactions:[],categories:[...defaultCategories],limits:{},chatHistory:[]};
+    const created=await fetch('/api/state/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({state:initial})});
+    if(created.status===409)return loadServerData();
+    data=await created.json();
+    if(!created.ok||!data.ok)throw new Error(data.error||'Өгөгдлийн сан үүсгэж чадсангүй.');
+    data.state=initial;
+  }else if(!response.ok||!data.ok)throw new Error(data.error||'Өгөгдлийн сан ажиллахгүй байна.');
+  const pending=JSON.parse(localStorage.getItem('ai-finance-pending-state')||'null');
+  if(pending){
+    if(JSON.stringify(pending.state)===JSON.stringify(data.state))localStorage.removeItem('ai-finance-pending-state');
+  }
+  const unsaved=JSON.parse(localStorage.getItem('ai-finance-pending-state')||'null');
+  if(unsaved){
+    if(unsaved.version!==data.version)throw new Error('Өөр төхөөрөмжийн мэдээлэл өөрчлөгдсөн байна. Энэ төхөөрөмжийн хадгалагдаагүй мэдээллийг шалгана уу.');
+    const retry=await fetch('/api/state',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(unsaved)});
+    const saved=await retry.json();
+    if(!retry.ok||!saved.ok)throw new Error(saved.error||'Хадгалагдаагүй мэдээллийг сэргээж чадсангүй.');
+    data={state:unsaved.state,version:saved.version};localStorage.removeItem('ai-finance-pending-state');
+  }
+  tx=data.state.transactions;categories=data.state.categories;categoryLimits=data.state.limits;chatHistory=data.state.chatHistory;
+  serverVersion=data.version;syncBlocked=false;
+  localStorage.setItem('ai-finance-tx',JSON.stringify(tx));
+  localStorage.setItem('ai-finance-categories',JSON.stringify(categories));
+  localStorage.setItem('ai-finance-category-limits',JSON.stringify(categoryLimits));
+  localStorage.setItem('ai-finance-chat-history',JSON.stringify(chatHistory));
+}
+function save(){localStorage.setItem('ai-finance-tx',JSON.stringify(tx));queuePersist()}function toast(s){let x=document.getElementById('toast');x.textContent=s;x.classList.add('show');setTimeout(()=>x.classList.remove('show'),2600)}
 function showAuth(mode){document.getElementById('landing').classList.add('hidden');document.getElementById('auth').classList.remove('hidden');renderAuth(mode)}function backLanding(){document.getElementById('auth').classList.add('hidden');document.getElementById('landing').classList.remove('hidden')}
 function renderAuth(mode){let signup=mode==='signup';document.getElementById('auth-content').innerHTML=`<h2>${signup?'Тавтай морил.':'Дахин уулзсандаа баяртай.'}</h2><p>${signup?'Санхүүгээ цэгцлэх эхний алхмаа хийгээрэй.':'Өөрийн санхүүгийн самбартаа нэвтэрнэ үү.'}</p>${signup?'<div class="field"><label>Таны нэр</label><input id="auth-name" placeholder="Жишээ: Оюунгэрэл"></div>':''}<div class="field"><label>Имэйл</label><input type="email" placeholder="name@example.com"></div><div class="field"><label>Нууц үг</label><input type="password" placeholder="••••••••"></div><button class="btn btn-primary full" onclick="enterApp()">${signup?'Үнэгүй эхлэх':'Нэвтрэх'} <span>→</span></button><div class="auth-switch">${signup?'Бүртгэлтэй юу?':'Шинэ хэрэглэгч үү?'} <a onclick="renderAuth('${signup?'login':'signup'}')">${signup?'Нэвтрэх':'Эрх үүсгэх'}</a></div>`}
-function enterApp(){document.getElementById('auth').classList.add('hidden');document.getElementById('landing').classList.add('hidden');document.getElementById('app').classList.remove('hidden');renderPage('dashboard');toast('Тавтай морил, Оюунгэрэл!')}
+async function enterApp(){try{await loadServerData()}catch(error){toast(error.message||'Өгөгдлийн сангийн холболт амжилтгүй.');return}document.getElementById('auth').classList.add('hidden');document.getElementById('landing').classList.add('hidden');document.getElementById('app').classList.remove('hidden');renderPage('dashboard');toast('Таны мэдээлэл серверээс ачаалагдлаа')}
 function logout(){document.getElementById('app').classList.add('hidden');document.getElementById('landing').classList.remove('hidden');toast('Та гарлаа')}
 function toggleSidebar(){document.querySelector('.sidebar').classList.toggle('open')}
 document.addEventListener('click',e=>{let b=e.target.closest('[data-page]');if(b){renderPage(b.dataset.page);document.querySelector('.sidebar')?.classList.remove('open')}});
@@ -61,7 +118,7 @@ function chatPage(){const history=chatHistory.slice(-12).map(item=>`<div class="
 function chatDraftCard(draft,index){return `<div class="draft-card ${draft.type}"><div class="draft-number">${index+1}</div><div class="draft-fields"><div class="field"><label>Тайлбар</label><input value="${esc(draft.note)}" onchange="updateChatDraft(${index},'note',this.value)"></div><div class="draft-grid"><div class="field"><label>Дүн</label><input type="number" min="1" value="${draft.amount}" onchange="updateChatDraft(${index},'amount',this.value)"></div><div class="field"><label>Төрөл</label><select onchange="updateChatDraft(${index},'type',this.value)"><option value="expense" ${draft.type==='expense'?'selected':''}>Зарлага</option><option value="income" ${draft.type==='income'?'selected':''}>Орлого</option></select></div><div class="field"><label>Ангилал</label><select onchange="updateChatDraft(${index},'category',this.value)">${categories.map(name=>`<option ${name===draft.category?'selected':''}>${esc(name)}</option>`).join('')}</select></div><div class="field"><label>Бүртгэл</label><select onchange="updateChatDraft(${index},'account',this.value)"><option ${draft.account==='Хувийн'?'selected':''}>Хувийн</option><option ${draft.account==='Бизнес'?'selected':''}>Бизнес</option></select></div><div class="field"><label>Огноо</label><input type="date" value="${draft.date}" onchange="updateChatDraft(${index},'date',this.value)"></div></div></div><button class="draft-remove" onclick="removeChatDraft(${index})" title="Саналаас хасах">×</button></div>`}
 function fillChatExample(button){document.getElementById('chat-text').value=button.textContent;document.getElementById('chat-text').focus()}
 function sendChatQuick(text){document.getElementById('chat-text').value=text;submitChatText()}
-function addChatMessage(role,text){chatHistory.push({role,text,time:new Date().toLocaleTimeString('mn-MN',{hour:'2-digit',minute:'2-digit'})});chatHistory=chatHistory.slice(-20);localStorage.setItem('ai-finance-chat-history',JSON.stringify(chatHistory))}
+function addChatMessage(role,text){chatHistory.push({role,text,time:new Date().toLocaleTimeString('mn-MN',{hour:'2-digit',minute:'2-digit'})});chatHistory=chatHistory.slice(-20);localStorage.setItem('ai-finance-chat-history',JSON.stringify(chatHistory));queuePersist()}
 async function submitChatText(fromVoice=false){const input=document.getElementById('chat-text'),text=input.value.trim(),account=document.getElementById('chat-default-account').value,sendButton=document.getElementById('chat-send');if(!text)return toast('Мессежээ бичнэ үү');sendButton.disabled=true;sendButton.textContent='…';let parsed=[],usedOpenAI=false,reply='';try{const response=await fetch('/api/ai/parse',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,categories,defaultAccount:account==='Бизнес'?'Бизнес':'Хувийн',selectedAccount:account==='Нэгдсэн'?'all':account,currentDate:todayISO(),history:chatHistory.slice(-12),transactions:tx.slice(0,100)})});const data=await response.json();if(!response.ok||!data.ok)throw new Error(data.error||'AI_PARSE_FAILED');reply=String(data.reply||'').trim();parsed=(data.transactions||[]).map((item,index)=>({id:Date.now()+index,date:/^20\d{2}-\d{2}-\d{2}$/.test(item.date)?item.date:todayISO(),type:item.type==='income'?'income':'expense',category:categories.includes(item.category)?item.category:(categories.includes('Бусад')?'Бусад':categories[0]),note:String(item.note||item.category||'Гүйлгээ').slice(0,120),account:item.account==='Бизнес'?'Бизнес':'Хувийн',amount:Math.round(Number(item.amount)||0),source:fromVoice?'Войс':'OpenAI веб чат'})).filter(item=>item.amount>0);usedOpenAI=true}catch(_error){parsed=parseFinanceText(text,account==='Бизнес'?'Бизнес':'Хувийн')}if(fromVoice){const voiceItems=parseFinanceText(text,account==='Бизнес'?'Бизнес':'Хувийн').map(item=>({...item,source:'Войс'}));if(voiceItems.length>parsed.length){parsed=voiceItems;reply='Танигдсан гүйлгээнүүдийг шалгаад баталгаажуулна уу.'}}addChatMessage('user',text);if(!parsed.length){addChatMessage('bot',reply||(usedOpenAI?'Дүн болон гүйлгээний утгыг арай дэлгэрэнгүй бичнэ үү.':'OpenAI холболт түр боломжгүй байна. Дүнтэй гүйлгээг “Хоол 18 мянга” гэж бичиж болно.'));chatDrafts=[];renderPage('chat');return}chatDrafts=parsed;if(reply)addChatMessage('bot',reply);renderPage('chat');document.querySelector('.chat-preview')?.scrollIntoView({behavior:'smooth',block:'nearest'});toast(usedOpenAI?'Гүйлгээний ноорог бэлэн':'OpenAI холболтгүй тул дүрмийн parser ашиглалаа')}
 let chatRecorder=null,chatVoiceStream=null,chatVoiceChunks=[],chatVoiceBusy=false;
 function setChatVoiceStatus(message){const status=document.getElementById('chat-voice-status');if(status)status.textContent=message}
@@ -103,7 +160,7 @@ async function toggleChatVoice(){
 function updateChatDraft(index,field,value){if(!chatDrafts[index])return;chatDrafts[index][field]=field==='amount'?Math.round(Number(value)):value}
 function removeChatDraft(index){chatDrafts.splice(index,1);renderPage('chat')}
 function cancelChatDrafts(){chatDrafts=[];renderPage('chat');toast('Санал цуцлагдлаа')}
-function saveChatDrafts(){if(!chatDrafts.length)return;if(chatDrafts.some(x=>!x.amount||x.amount<1))return toast('Бүх гүйлгээний дүнг шалгана уу');const warnings=chatDrafts.filter(x=>x.type==='expense'&&categoryLimits[x.category]).map(x=>{const spent=limitSpent(x.category),limit=Number(categoryLimits[x.category]),next=spent+x.amount;return next>limit?`${x.category}: ${money(next-limit)}-өөр лимит хэтэрнэ`:''}).filter(Boolean);if(warnings.length&&!confirm(`Лимитийн анхааруулга:\n${warnings.join('\n')}\n\nГүйлгээнүүдийг бүртгэх үү?`))return;const now=Date.now();chatDrafts.forEach((draft,index)=>tx.unshift({...draft,id:now+index}));const count=chatDrafts.length;save();chatHistory.push({role:'bot',text:`${count} гүйлгээ амжилттай бүртгэгдлээ.`,time:new Date().toLocaleTimeString('mn-MN',{hour:'2-digit',minute:'2-digit'})});chatHistory=chatHistory.slice(-20);localStorage.setItem('ai-finance-chat-history',JSON.stringify(chatHistory));chatDrafts=[];renderPage('chat');toast(`${count} гүйлгээ бүртгэгдлээ`)}
+function saveChatDrafts(){if(!chatDrafts.length)return;if(chatDrafts.some(x=>!x.amount||x.amount<1))return toast('Бүх гүйлгээний дүнг шалгана уу');const warnings=chatDrafts.filter(x=>x.type==='expense'&&categoryLimits[x.category]).map(x=>{const spent=limitSpent(x.category),limit=Number(categoryLimits[x.category]),next=spent+x.amount;return next>limit?`${x.category}: ${money(next-limit)}-өөр лимит хэтэрнэ`:''}).filter(Boolean);if(warnings.length&&!confirm(`Лимитийн анхааруулга:\n${warnings.join('\n')}\n\nГүйлгээнүүдийг бүртгэх үү?`))return;const now=Date.now();chatDrafts.forEach((draft,index)=>tx.unshift({...draft,id:now+index}));const count=chatDrafts.length;save();chatHistory.push({role:'bot',text:`${count} гүйлгээ амжилттай бүртгэгдлээ.`,time:new Date().toLocaleTimeString('mn-MN',{hour:'2-digit',minute:'2-digit'})});chatHistory=chatHistory.slice(-20);localStorage.setItem('ai-finance-chat-history',JSON.stringify(chatHistory));queuePersist();chatDrafts=[];renderPage('chat');toast(`${count} гүйлгээ бүртгэгдлээ`)}
 function expenseCategories(){return categories.filter(name=>tx.some(x=>x.category===name&&x.type==='expense')||!tx.some(x=>x.category===name&&x.type==='income'))}
 function limitSpent(name,items=tx){const month=todayISO().slice(0,7);return items.filter(x=>x.date.startsWith(month)&&x.type==='expense'&&x.category===name).reduce((sum,x)=>sum+x.amount,0)}
 function limitCard(name,items=tx,editable=false){const limit=Number(categoryLimits[name])||0,spent=limitSpent(name,items),percent=limit?spent/limit*100:0,status=percent>=100?'over':percent>=80?'warn':'safe';return `<div class="limit-card ${status}"><div class="limit-card-head"><div><b>${esc(name)}</b><small>Сарын лимит</small></div><strong>${money(limit)}</strong></div><div class="limit-track"><i style="width:${Math.min(percent,100)}%"></i></div><div class="limit-meta"><span>${money(spent)} зарцуулсан</span><b>${percent>=100?money(spent-limit)+' хэтэрсэн':money(limit-spent)+' үлдсэн'}</b></div>${editable?`<div class="limit-actions"><button onclick="openLimitModal('${encodeURIComponent(name)}')">Засах</button><button class="danger-link" onclick="removeLimit('${encodeURIComponent(name)}')">Арилгах</button></div>`:''}</div>`}
