@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: ai-sankhuu
+    runtime: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SITE_ACCESS_PASSWORD
+        sync: false
