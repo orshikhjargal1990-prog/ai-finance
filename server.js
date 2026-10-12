@@ -27,6 +27,32 @@ const publicDir = __dirname;
 const telegram = telegramToken ? createTelegramClient(telegramToken) : null;
 const parseWithOpenAI = createFinanceParser(openaiApiKey, openaiModel);
 const speechClient = openaiApiKey ? new OpenAI({ apiKey: openaiApiKey }) : null;
+const emptyState = () => ({ transactions: [], categories: ['Хоол', 'Материал', 'Тээвэр', 'Борлуулалт', 'Цалин', 'Бусад'], limits: {}, chatHistory: [] });
+const hashToken = token => crypto.createHash('sha256').update(token).digest('hex');
+const cookieName = 'finance_session';
+const loginAttempts = new Map();
+const scrypt = (password, salt) => new Promise((resolve, reject) => crypto.scrypt(password, salt, 64, (error, key) => error ? reject(error) : resolve(key)));
+async function passwordHash(password) { const salt = crypto.randomBytes(16).toString('hex'); return `${salt}:${(await scrypt(password, salt)).toString('hex')}`; }
+async function passwordMatches(password, saved) {
+  const [salt, expectedHex] = String(saved || '').split(':');
+  if (!salt || !expectedHex || !/^[a-f0-9]{32}$/.test(salt) || !/^[a-f0-9]{128}$/.test(expectedHex)) return false;
+  const actual = await scrypt(password, salt);
+  return crypto.timingSafeEqual(actual, Buffer.from(expectedHex, 'hex'));
+}
+const dummyPasswordHash = passwordHash('invalid-password-placeholder');
+function sessionToken(request) {
+  const match = new RegExp(`(?:^|; )${cookieName}=([a-f0-9]{64})(?:;|$)`).exec(request.get('cookie') || '');
+  return match?.[1] || '';
+}
+async function startSession(user, response) {
+  const token = crypto.randomBytes(32).toString('hex');
+  await database.createSession(hashToken(token), user.id);
+  response.cookie(cookieName, token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/', maxAge: 30 * 86400 * 1000 });
+}
+function authError(response, error) {
+  console.error('[Auth] Өгөгдлийн сангийн алдаа.', { code: error.code });
+  return response.status(503).json({ ok: false, error: 'Бүртгэлийн сан түр ажиллахгүй байна.' });
+}
 
 async function handleTelegramUpdate(update) {
   const message = update.message;
@@ -46,17 +72,12 @@ async function handleTelegramUpdate(update) {
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
-
 app.use((request, response, next) => {
-  if (!siteAccessPassword || request.path === '/api/health' || request.path === '/api/telegram/webhook') return next();
-  const match = /^Basic\s+(.+)$/i.exec(request.get('authorization') || '');
-  let credentials = '';
-  try { credentials = match ? Buffer.from(match[1], 'base64').toString('utf8') : ''; } catch { /* invalid header */ }
-  const supplied = Buffer.from(credentials);
-  const expected = Buffer.from(`finance:${siteAccessPassword}`);
-  if (supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected)) return next();
-  response.set('WWW-Authenticate', 'Basic realm="AI Finance", charset="UTF-8"');
-  return response.status(401).send('Нэвтрэх эрх шаардлагатай.');
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method) || request.path === '/api/telegram/webhook') return next();
+  const origin = request.get('origin');
+  const expected = `${process.env.NODE_ENV === 'production' ? 'https' : request.protocol}://${request.get('host')}`;
+  if (origin !== expected) return response.status(403).json({ ok: false, error: 'Хүсэлтийн эх сурвалж зөвшөөрөгдөөгүй.' });
+  next();
 });
 
 app.get('/api/health', (_request, response) => {
@@ -69,10 +90,76 @@ app.get('/api/health', (_request, response) => {
   });
 });
 
-app.get('/api/state', async (_request, response) => {
+app.post('/api/auth/signup', async (request, response) => {
+  if (!database.enabled()) return response.status(503).json({ ok: false, error: 'Өгөгдлийн сан тохируулагдаагүй байна.' });
+  const invite = Buffer.from(String(request.body?.inviteCode || ''));
+  const expectedInvite = Buffer.from(siteAccessPassword);
+  if (!siteAccessPassword || invite.length !== expectedInvite.length || !crypto.timingSafeEqual(invite, expectedInvite)) return response.status(403).json({ ok: false, error: 'Бүртгэлийн урилгын код буруу байна.' });
+  const email = String(request.body?.email || '').trim().toLowerCase();
+  const name = String(request.body?.name || '').trim();
+  const password = request.body?.password;
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254 || !name || name.length > 80 || typeof password !== 'string' || password.length < 12 || password.length > 128) return response.status(400).json({ ok: false, error: 'Нэр, зөв имэйл, 12-оос дээш тэмдэгттэй нууц үг оруулна уу.' });
+  try {
+    const user = await database.createUser(email, name, await passwordHash(password), emptyState());
+    await startSession(user, response);
+    return response.status(201).json({ ok: true, user });
+  } catch (error) {
+    if (error.code === '23505') return response.status(409).json({ ok: false, error: 'Энэ имэйлээр бүртгэл аль хэдийн үүссэн байна.' });
+    return authError(response, error);
+  }
+});
+
+app.post('/api/auth/login', async (request, response) => {
+  const email = String(request.body?.email || '').trim().toLowerCase();
+  const password = request.body?.password;
+  if (!email || typeof password !== 'string') return response.status(400).json({ ok: false, error: 'Имэйл, нууц үгээ оруулна уу.' });
+  const bucket = `${request.ip}:${email}`;
+  const attempt = loginAttempts.get(bucket);
+  if (attempt && attempt.until > Date.now() && attempt.count >= 10) return response.status(429).json({ ok: false, error: 'Олон удаа оролдлоо. 15 минутын дараа дахин оролдоно уу.' });
+  try {
+    const user = await database.findUserByEmail(email);
+    const valid = await passwordMatches(password, user?.password_hash || await dummyPasswordHash);
+    if (!valid) {
+      loginAttempts.set(bucket, { count: (attempt?.until > Date.now() ? attempt.count : 0) + 1, until: Date.now() + 15 * 60 * 1000 });
+      return response.status(401).json({ ok: false, error: 'Имэйл эсвэл нууц үг буруу байна.' });
+    }
+    loginAttempts.delete(bucket);
+    await startSession(user, response);
+    return response.json({ ok: true, user: { id: user.id, email: user.email, name: user.name } });
+  } catch (error) { return authError(response, error); }
+});
+
+app.get('/api/auth/me', async (request, response) => {
+  try {
+    const token = sessionToken(request);
+    const user = token && await database.getSession(hashToken(token));
+    return user ? response.json({ ok: true, user }) : response.status(401).json({ ok: false, error: 'Нэвтрэх шаардлагатай.' });
+  } catch (error) { return authError(response, error); }
+});
+
+app.post('/api/auth/logout', async (request, response) => {
+  try {
+    const token = sessionToken(request);
+    if (token) await database.deleteSession(hashToken(token));
+    response.clearCookie(cookieName, { path: '/', sameSite: 'lax', secure: process.env.NODE_ENV === 'production' });
+    return response.json({ ok: true });
+  } catch (error) { return authError(response, error); }
+});
+
+app.use('/api', async (request, response, next) => {
+  if (request.path === '/telegram/webhook') return next();
+  try {
+    const token = sessionToken(request);
+    request.user = token && await database.getSession(hashToken(token));
+    if (!request.user) return response.status(401).json({ ok: false, error: 'Нэвтрэх шаардлагатай.' });
+    next();
+  } catch (error) { return authError(response, error); }
+});
+
+app.get('/api/state', async (request, response) => {
   if (!database.enabled()) return response.status(503).json({ ok: false, error: 'Өгөгдлийн сан тохируулагдаагүй байна.' });
   try {
-    const result = await database.getState();
+    const result = await database.getUserState(request.user.id);
     return result ? response.json({ ok: true, ...result }) : response.status(404).json({ ok: false, error: 'Өгөгдөл хараахан үүсээгүй байна.' });
   } catch (error) {
     console.error('[Database] Уншихад алдаа гарлаа.', { code: error.code });
@@ -80,17 +167,16 @@ app.get('/api/state', async (_request, response) => {
   }
 });
 
-app.post('/api/state/import', async (request, response) => {
-  if (!database.enabled()) return response.status(503).json({ ok: false, error: 'Өгөгдлийн сан тохируулагдаагүй байна.' });
-  const state = database.cleanState(request.body?.state);
-  if (!state) return response.status(400).json({ ok: false, error: 'Өгөгдлийн бүтэц буруу байна.' });
+app.post('/api/state/claim-legacy', async (request, response) => {
+  const supplied = Buffer.from(String(request.body?.sitePassword || ''));
+  const expected = Buffer.from(siteAccessPassword);
+  if (!siteAccessPassword || supplied.length !== expected.length || !crypto.timingSafeEqual(supplied, expected)) return response.status(403).json({ ok: false, error: 'Өмнөх сайтын нууц үг буруу байна.' });
   try {
-    const result = await database.createState(state);
-    return result ? response.status(201).json({ ok: true, ...result }) : response.status(409).json({ ok: false, error: 'Өгөгдөл аль хэдийн үүссэн байна.' });
-  } catch (error) {
-    console.error('[Database] Шилжүүлэхэд алдаа гарлаа.', { code: error.code });
-    return response.status(503).json({ ok: false, error: 'Өгөгдлийн сантай холбогдож чадсангүй.' });
-  }
+    const current = await database.getUserState(request.user.id);
+    if (current?.version !== 1) return response.status(409).json({ ok: false, error: 'Энэ бүртгэлд мэдээлэл хадгалагдсан байна.' });
+    const result = await database.claimLegacyState(request.user.id);
+    return result ? response.json({ ok: true, ...result }) : response.status(409).json({ ok: false, error: 'Өмнөх мэдээллийг аль хэдийн шилжүүлсэн эсвэл олдсонгүй.' });
+  } catch (error) { return authError(response, error); }
 });
 
 app.put('/api/state', async (request, response) => {
@@ -99,7 +185,7 @@ app.put('/api/state', async (request, response) => {
   const version = Number(request.body?.version);
   if (!state || !Number.isSafeInteger(version) || version < 1) return response.status(400).json({ ok: false, error: 'Өгөгдлийн бүтэц буруу байна.' });
   try {
-    const result = await database.updateState(state, version);
+    const result = await database.updateUserState(request.user.id, state, version);
     return result ? response.json({ ok: true, ...result }) : response.status(409).json({ ok: false, error: 'Өөр төхөөрөмж дээр мэдээлэл өөрчлөгдсөн байна. Хуудсаа дахин ачаална уу.' });
   } catch (error) {
     console.error('[Database] Хадгалахад алдаа гарлаа.', { code: error.code });
