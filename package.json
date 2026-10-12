@@ -2,11 +2,11 @@
   "name": "ai-sankhuu",
   "version": "0.1.0",
   "private": true,
-  "description": "AI Санхүү веб болон Telegram webhook backend",
+  "description": "AI \u0421\u0430\u043d\u0445\u04af\u04af \u0432\u0435\u0431 \u0431\u043e\u043b\u043e\u043d Telegram webhook backend",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js",
+    "start": "node api.js && node server.js",
+    "dev": "node api.js && node --watch server.js",
     "check": "node --check server.js && node --check database.js && node --check telegram-api.js && node --check openai-parser.js && node --check finance-tools.js && node --check speech-normalizer.js && node --check scripts/configure-telegram-webhook.js && node --check app.js && node --check landing.js && node finance-tools-check.cjs",
     "telegram:webhook:set": "node scripts/configure-telegram-webhook.js"
   },
