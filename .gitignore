@@ -1,9 +1,11 @@
 node_modules/
-.env
-.env.*
 !.env.example
 npm-debug.log*
 .DS_Store
 *.pem
 *.key
 *.secret
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+config.bat
