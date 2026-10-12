@@ -20,9 +20,6 @@ const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET?.trim() || '';
 const openaiApiKey = process.env.OPENAI_API_KEY?.trim() || '';
 const openaiModel = process.env.OPENAI_MODEL?.trim() || 'gpt-4o-mini';
 const siteAccessPassword = process.env.SITE_ACCESS_PASSWORD || '';
-if (process.env.NODE_ENV === 'production' && database.enabled() && !siteAccessPassword) {
-  throw new Error('SITE_ACCESS_PASSWORD is required when DATABASE_URL is configured in production');
-}
 const publicDir = __dirname;
 const telegram = telegramToken ? createTelegramClient(telegramToken) : null;
 const parseWithOpenAI = createFinanceParser(openaiApiKey, openaiModel);
@@ -92,9 +89,6 @@ app.get('/api/health', (_request, response) => {
 
 app.post('/api/auth/signup', async (request, response) => {
   if (!database.enabled()) return response.status(503).json({ ok: false, error: 'Өгөгдлийн сан тохируулагдаагүй байна.' });
-  const invite = Buffer.from(String(request.body?.inviteCode || ''));
-  const expectedInvite = Buffer.from(siteAccessPassword);
-  if (!siteAccessPassword || invite.length !== expectedInvite.length || !crypto.timingSafeEqual(invite, expectedInvite)) return response.status(403).json({ ok: false, error: 'Бүртгэлийн урилгын код буруу байна.' });
   const email = String(request.body?.email || '').trim().toLowerCase();
   const name = String(request.body?.name || '').trim();
   const password = request.body?.password;
